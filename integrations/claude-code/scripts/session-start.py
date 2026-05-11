@@ -23,11 +23,15 @@ from pathlib import Path
 
 # Add scripts dir to path for config import
 sys.path.insert(0, os.path.dirname(__file__))
+from _plugin_common import touch_activity
 from config import (
     ensure_cognee_ready,
+    ensure_dataset_ready,
+    ensure_dataset_ready_via_api,
     ensure_identity,
     get_dataset,
     get_session_id,
+    is_cloud_mode,
     load_config,
     save_config,
 )
@@ -78,8 +82,6 @@ def _spawn_idle_watcher(session_id: str, dataset: str, config: dict) -> None:
         "dataset": dataset,
         "config": {
             "service_url": config.get("service_url", ""),
-            "api_key": config.get("api_key", ""),
-            "llm_api_key": config.get("llm_api_key", ""),
             "llm_model": config.get("llm_model", ""),
             "dataset": dataset,
         },
@@ -122,7 +124,7 @@ def _write_resolved(
     _RESOLVED_CACHE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-async def _start():
+async def _start(out_stream=None):
     config = load_config()
     cwd = os.environ.get("CLAUDE_CWD", os.getcwd())
 
@@ -143,6 +145,23 @@ async def _start():
     except Exception as e:
         print(f"cognee-plugin: identity warning ({e})", file=sys.stderr)
 
+    try:
+        if user_id and is_cloud_mode(config):
+            await ensure_dataset_ready_via_api(
+                config.get("service_url", ""),
+                agent_api_key or config.get("api_key", ""),
+                dataset,
+            )
+        elif user_id:
+            from uuid import UUID
+
+            from cognee.modules.users.methods import get_user
+
+            user = await get_user(UUID(user_id))
+            await ensure_dataset_ready(dataset, user)
+    except Exception as e:
+        print(f"cognee-plugin: dataset warning ({e})", file=sys.stderr)
+
     # Write resolved values for other hooks
     _write_resolved(session_id, dataset, user_id, cwd, api_key=agent_api_key)
 
@@ -150,6 +169,11 @@ async def _start():
     config_file = Path.home() / ".cognee-plugin" / "config.json"
     if not config_file.exists():
         save_config(config)
+
+    # Reset the idle clock for this Claude process before the watcher
+    # starts, otherwise a stale timestamp from a prior session can cause
+    # an immediate improve on startup.
+    touch_activity()
 
     # Launch the idle watcher. If COGNEE_IDLE_DISABLED is set, skip it.
     if os.environ.get("COGNEE_IDLE_DISABLED", "").lower() not in ("1", "true", "yes"):
@@ -186,17 +210,26 @@ async def _start():
             ),
         }
     }
-    print(json.dumps(guidance))
+    print(json.dumps(guidance), file=out_stream or sys.stdout)
 
 
 def main():
     # Read stdin (SessionStart payload) — consumed but not used
     sys.stdin.read()
 
+    # Claude Code expects pure JSON on stdout for hookSpecificOutput. Some
+    # cognee codepaths print human-facing banners directly to stdout, which
+    # would contaminate the hook output and prevent systemMessage from
+    # rendering in the user's terminal. Redirect stdout to stderr while we
+    # run, then write our JSON to the saved real stdout at the very end.
+    real_stdout = sys.stdout
+    sys.stdout = sys.stderr
     try:
-        asyncio.run(_start())
+        asyncio.run(_start(real_stdout))
     except Exception as exc:
         print(f"cognee-plugin: session start failed ({exc})", file=sys.stderr)
+    finally:
+        sys.stdout = real_stdout
 
 
 if __name__ == "__main__":

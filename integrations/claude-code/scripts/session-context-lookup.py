@@ -18,10 +18,17 @@ import sys
 
 # Add scripts dir to path for helper imports
 sys.path.insert(0, os.path.dirname(__file__))
-from _plugin_common import hook_log, load_resolved, notify, read_and_reset_save_counter
-from config import ensure_cognee_ready, get_session_id, load_config
+from _plugin_common import (
+    hook_log,
+    load_resolved,
+    notify,
+    read_and_reset_save_counter,
+    recall_via_http,
+    resolve_user,
+)
+from config import ensure_cognee_ready, get_session_id, is_cloud_mode, load_config
 
-TOP_K = 3
+TOP_K = 5
 TRUNCATE_ANSWER = 500
 TRUNCATE_RETURN = 400
 TRUNCATE_GRAPH_CTX = 1500
@@ -36,12 +43,18 @@ def _load_session_id() -> str:
     return session_id
 
 
+def _load_user_id() -> str:
+    return load_resolved().get("user_id", "")
+
+
 def _format_entry(entry: dict) -> str:
     """Format a single recall result according to its _source tag."""
-    source = entry.get("_source", "")
+    source = entry.get("source", "")
 
     if source == "graph_context":
-        content = str(entry.get("content", ""))[:TRUNCATE_GRAPH_CTX]
+        # graph_context entries carry `content`; graph_completion results
+        # (folded in from scope=graph) carry `text`. Try both.
+        content = str(entry.get("content", "") or entry.get("text", ""))[:TRUNCATE_GRAPH_CTX]
         return f"[graph-snapshot]\n{content}"
 
     if source == "trace":
@@ -72,9 +85,19 @@ def _format_entry(entry: dict) -> str:
     return "\n".join(lines)
 
 
-async def _run(prompt: str):
-    import cognee
+def _has_entry_content(entry: dict) -> bool:
+    """Return True when a recall entry has useful content to inject."""
+    source = entry.get("source", "")
+    if source == "graph_context":
+        return bool(str(entry.get("content", "") or entry.get("text", "")).strip())
+    if source == "trace":
+        fields = ("origin_function", "status", "session_feedback", "method_return_value")
+    else:
+        fields = ("question", "answer")
+    return any(str(entry.get(field, "") or "").strip() for field in fields)
 
+
+async def _run(prompt: str, out_stream=None):
     config = load_config()
     await ensure_cognee_ready(config)
 
@@ -85,27 +108,95 @@ async def _run(prompt: str):
 
     saves_last_turn = read_and_reset_save_counter(session_id)
 
-    try:
-        results = await cognee.recall(
-            prompt,
-            session_id=session_id,
-            top_k=TOP_K,
-            scope=["session", "trace", "graph_context"],
-        )
-    except Exception as exc:
-        hook_log("recall_error", {"error": str(exc)[:200]})
-        results = []
+    # Run scopes independently: a failure in one (e.g. graph search hitting an
+    # empty/locked Ladybug DB) must not discard hits already collected from the
+    # others. cognee.recall loops over scopes and re-raises on the first failure,
+    # so we call it once per scope and collect whatever succeeds.
+    results: list = []
+    scope_specs = [
+        (["session"], None),
+        (["trace"], None),
+        (["graph_context"], None),
+        (["graph"], "GRAPH_COMPLETION"),
+    ]
+    cloud_mode = is_cloud_mode(config)
+    if not cloud_mode:
+        import cognee
+        from cognee.modules.search.types import SearchType
+
+        user = await resolve_user(_load_user_id())
+
+    for scope_list, qtype in scope_specs:
+        try:
+            if cloud_mode:
+                part = recall_via_http(
+                    prompt,
+                    session_id=session_id,
+                    top_k=TOP_K,
+                    scope=scope_list,
+                    only_context=True,
+                    search_type=qtype,
+                )
+            else:
+                query_type = SearchType.GRAPH_COMPLETION if qtype == "GRAPH_COMPLETION" else None
+                part = await cognee.recall(
+                    prompt,
+                    session_id=session_id,
+                    top_k=TOP_K,
+                    scope=scope_list,
+                    only_context=True,
+                    query_type=query_type,
+                    user=user,
+                )
+            if part:
+                results.extend(part)
+        except Exception as exc:
+            hook_log("recall_error", {"scope": scope_list, "error": str(exc)[:200]})
 
     # Bucket results by _source for human-readable output.
+    # Local SDK mode returns Pydantic models (ResponseQAEntry, etc.); cloud
+    # mode returns plain dicts via HTTP. Normalize to dicts here.
     by_source: dict[str, list] = {"session": [], "trace": [], "graph_context": []}
     for r in results or []:
+        if hasattr(r, "model_dump"):
+            r = r.model_dump()
         if not isinstance(r, dict):
             continue
-        src = r.get("_source", "session")
+        src = r.get("source", "session")
+        # Fold scope=graph (GRAPH_COMPLETION) results into the graph_context
+        # bucket so the displayed `g` counter reflects what was retrieved.
+        if src == "graph":
+            r["source"] = "graph_context"
+            src = "graph_context"
+        if not _has_entry_content(r):
+            continue
         by_source.setdefault(src, []).append(r)
 
     counts = {k: len(v) for k, v in by_source.items()}
     total = sum(counts.values())
+
+    # Write last-turn counts so the status line script can render them.
+    # Best-effort; failure here must not break the hook output.
+    try:
+        from pathlib import Path as _Path
+
+        _state = _Path.home() / ".cognee-plugin" / "last_recall.json"
+        _state.parent.mkdir(parents=True, exist_ok=True)
+        _state.write_text(
+            json.dumps(
+                {
+                    "session_id": session_id,
+                    "ts": __import__("datetime")
+                    .datetime.now(__import__("datetime").timezone.utc)
+                    .isoformat(timespec="seconds"),
+                    "hits": counts,
+                    "saves_last_turn": saves_last_turn,
+                }
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
     # Build a one-line visibility header so the user (via the assistant's
     # context) can tell that memory fired on this turn — both what it
@@ -149,6 +240,33 @@ async def _run(prompt: str):
         hook_log("context_lookup_empty", {"saves_last_turn": saves_last_turn})
         notify(f"no recall matches; saves last turn {saves_last_turn}")
 
+    # Audit log: persist the full injected context per turn. The Claude Code
+    # JSONL transcript does not preserve UserPromptSubmit additionalContext,
+    # so this file is the source of truth for "what did the plugin give
+    # Claude on prompt X."
+    try:
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+        from pathlib import Path as _Path
+
+        _audit = _Path.home() / ".cognee-plugin" / "recall-audit.log"
+        _audit.parent.mkdir(parents=True, exist_ok=True)
+        with _audit.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "ts": _dt.now(_tz.utc).isoformat(timespec="seconds"),
+                        "session_id": session_id,
+                        "prompt": prompt,
+                        "hits": counts,
+                        "context": context,
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+
     output = {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
@@ -159,7 +277,7 @@ async def _run(prompt: str):
             "systemMessage": header,
         }
     }
-    print(json.dumps(output))
+    print(json.dumps(output), file=out_stream or sys.stdout)
 
 
 def main():
@@ -176,10 +294,19 @@ def main():
     if not prompt or len(prompt) < 5:
         return
 
+    # Claude Code expects pure JSON on stdout. Some cognee codepaths (e.g.
+    # serve registration) print human-facing banners to stdout, which would
+    # otherwise contaminate the hook output and prevent systemMessage from
+    # rendering in the user's terminal. Redirect stdout to stderr for the
+    # cognee call, then write our JSON to the real stdout at the end.
+    real_stdout = sys.stdout
+    sys.stdout = sys.stderr
     try:
-        asyncio.run(_run(prompt))
+        asyncio.run(_run(prompt, real_stdout))
     except Exception as exc:
         hook_log("context_lookup_exception", {"error": str(exc)[:200]})
+    finally:
+        sys.stdout = real_stdout
 
 
 if __name__ == "__main__":

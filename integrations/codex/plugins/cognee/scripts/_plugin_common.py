@@ -1,6 +1,6 @@
 """Shared helpers across plugin hook scripts.
 
-Kept deliberately small: user resolution, resolved-cache read, a
+Kept deliberately small: user resolution, runtime-state read, a
 single log-to-disk helper. Hook scripts shouldn't grow heavy because
 they run on every user prompt / tool call.
 """
@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from contextlib import contextmanager
@@ -18,7 +19,6 @@ from pathlib import Path
 from typing import Optional
 
 _PLUGIN_DIR = Path.home() / ".cognee-plugin" / "codex"
-_RESOLVED_CACHE = _PLUGIN_DIR / "resolved.json"
 _HOOK_LOG = _PLUGIN_DIR / "hook.log"
 _COUNTER_FILE = _PLUGIN_DIR / "counter.json"
 _ACTIVITY_FILE = _PLUGIN_DIR / "activity.ts"
@@ -29,6 +29,7 @@ _HTTP_BRIDGE_CACHE = _PLUGIN_DIR / "http_bridge_cache.json"
 _HTTP_BRIDGE_STATE = _PLUGIN_DIR / "http_bridge_state.json"
 _PENDING_PROMPTS = _PLUGIN_DIR / "pending_prompts.json"
 _SUBPROCESS_LOG = _PLUGIN_DIR / "subprocess.log"
+_AGENT_KEYS_CACHE = _PLUGIN_DIR / "agent_keys.json"
 
 # Save-kinds tracked per turn. Keep this tuple in sync with bump_save_counter callers.
 SAVE_KINDS = ("prompt", "trace", "answer")
@@ -39,18 +40,129 @@ _LOG_LINE_CAP = 600
 # Default auto-improve threshold (tool calls + stops). Env override.
 AUTO_IMPROVE_EVERY_DEFAULT = 30
 SYNC_LOCK_STALE_SECONDS = 15 * 60
+_DEFAULT_LOCAL_SERVICE_URL = "http://localhost:8011"
 
 
-def load_resolved() -> dict:
-    """Load the SessionStart-cached session state."""
-    if _RESOLVED_CACHE.exists():
-        try:
-            return json.loads(_RESOLVED_CACHE.read_text(encoding="utf-8"))
-        except Exception as exc:
-            hook_log(
-                "resolved_load_failed", {"path": str(_RESOLVED_CACHE), "error": str(exc)[:200]}
-            )
-    return {}
+def _sanitize_session_key(value: str) -> str:
+    safe = []
+    for ch in str(value or ""):
+        if ch.isalnum() or ch in ("-", "_", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    return "".join(safe).strip("._")[:120]
+
+
+def get_session_key() -> str:
+    candidates = [
+        os.environ.get("COGNEE_SESSION_KEY"),
+    ]
+    for value in candidates:
+        text = _sanitize_session_key(str(value or "").strip())
+        if text:
+            return text
+    return ""
+
+
+def set_session_key(session_key: str) -> str:
+    normalized = _sanitize_session_key(session_key)
+    if normalized:
+        os.environ["COGNEE_SESSION_KEY"] = normalized
+    return normalized
+
+
+def _resolve_agent_name() -> str:
+    def _normalize(name: str) -> str:
+        raw = str(name or "").strip()
+        if raw.endswith("@cognee.agent"):
+            raw = raw[: -len("@cognee.agent")]
+        suffix = "_codex"
+        if raw.endswith(suffix):
+            return raw
+        return f"{raw}{suffix}"
+
+    env_name = str(os.environ.get("COGNEE_AGENT_NAME") or "").strip()
+    if env_name:
+        return _normalize(env_name)
+    try:
+        from config import load_config  # type: ignore
+
+        configured = str(load_config().get("agent_name") or "").strip()
+        if configured:
+            normalized = _normalize(configured)
+            os.environ["COGNEE_AGENT_NAME"] = normalized
+            return normalized
+    except Exception:
+        pass
+    return _normalize("codex-agent")
+
+
+def load_resolved(session_key: str = "") -> dict:
+    """Load runtime state from Cognee HTTP endpoints (no file cache)."""
+    resolved: dict = {}
+
+    active_session_key = _sanitize_session_key(session_key) or get_session_key()
+    if active_session_key:
+        resolved["session_key"] = active_session_key
+
+    service_url = _local_api_url().strip()
+    if service_url:
+        resolved["service_url"] = service_url
+
+    api_key = _api_key().strip()
+    if api_key:
+        resolved["api_key"] = api_key
+
+    # Resolve caller identity.
+    try:
+        me = _json_http_request("/api/v1/users/me", method="GET", timeout=10.0)
+        if isinstance(me, dict):
+            user_id = str(me.get("id") or "").strip()
+            if user_id:
+                resolved["user_id"] = user_id
+    except Exception as exc:
+        hook_log("runtime_state_users_me_failed", {"error": str(exc)[:200]})
+
+    # Resolve active connection details for this session when possible.
+    try:
+        query = ""
+        if active_session_key:
+            query = f"?agent_session_name={urllib.parse.quote(active_session_key, safe='')}"
+        conn = _json_http_request(
+            f"/api/v1/agents/connections/me{query}",
+            method="GET",
+            timeout=10.0,
+        )
+        if isinstance(conn, dict):
+            agent = conn.get("agent") if isinstance(conn.get("agent"), dict) else {}
+            if isinstance(agent, dict):
+                session_id = str(agent.get("session_id") or "").strip()
+                if session_id:
+                    resolved["session_id"] = session_id
+                agent_session_name = str(agent.get("agent_session_name") or "").strip()
+                if agent_session_name:
+                    resolved["agent_session_name"] = agent_session_name
+                agent_user_id = str(agent.get("user_id") or "").strip()
+                if agent_user_id and not resolved.get("user_id"):
+                    resolved["user_id"] = agent_user_id
+                status = str(agent.get("status") or "").strip().lower()
+                resolved["registered"] = status == "active"
+                datasets = agent.get("datasets") if isinstance(agent.get("datasets"), list) else []
+                for item in datasets:
+                    if isinstance(item, dict):
+                        name = str(item.get("name") or "").strip()
+                        if name:
+                            resolved["dataset"] = name
+                            break
+    except Exception as exc:
+        hook_log("runtime_state_connection_lookup_failed", {"error": str(exc)[:200]})
+
+    return resolved
+
+
+def write_resolved(data: dict, session_key: str = "", *, mirror_global: bool = True) -> None:
+    # Runtime state now comes from API endpoints, not local resolved files.
+    _ = (data, session_key, mirror_global)
 
 
 def _load_json_file(path: Path) -> dict:
@@ -71,7 +183,7 @@ def _write_json_file(path: Path, data: dict) -> None:
 
 
 def _bridge_cache_key(dataset: str, session_id: str) -> str:
-    user_id = load_resolved().get("user_id", "")
+    user_id = os.environ.get("COGNEE_USER_ID", "") or load_resolved().get("user_id", "")
     return f"{user_id}:{dataset}:{session_id}"
 
 
@@ -394,15 +506,86 @@ def sync_lock(owner: str):
 
 
 def _local_api_url() -> str:
-    return (
-        os.environ.get("COGNEE_LOCAL_API_URL")
-        or os.environ.get("COGNEE_SERVICE_URL")
-        or "http://localhost:8000"
-    )
+    direct = (
+        os.environ.get("COGNEE_LOCAL_API_URL") or os.environ.get("COGNEE_SERVICE_URL") or ""
+    ).strip()
+    if direct:
+        return direct
+    return _DEFAULT_LOCAL_SERVICE_URL
+
+
+def _normalize_service_url(value: str) -> str:
+    return str(value or "").strip().rstrip("/")
 
 
 def _api_key() -> str:
-    return load_resolved().get("api_key", "") or os.environ.get("COGNEE_API_KEY", "")
+    service_url = _normalize_service_url(_local_api_url())
+    agent_name = _resolve_agent_name()
+    if not service_url:
+        return str(os.environ.get("COGNEE_API_KEY", "") or "").strip()
+
+    cache = _load_json_file(_AGENT_KEYS_CACHE)
+    entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
+    if isinstance(entries, dict) and agent_name:
+        selected: dict | None = None
+        cache_key = f"{service_url}::{agent_name}"
+        entry = entries.get(cache_key)
+        if isinstance(entry, dict):
+            selected = entry
+        else:
+            # Backward compatibility for older cache formats where keys may differ.
+            for value in entries.values():
+                if not isinstance(value, dict):
+                    continue
+                url = _normalize_service_url(str(value.get("service_url") or ""))
+                name = str(value.get("agent_name") or "").strip()
+                if url == service_url and name == agent_name:
+                    selected = value
+                    break
+        if isinstance(selected, dict):
+            key = str(selected.get("api_key") or "").strip()
+            if key:
+                os.environ["COGNEE_API_KEY"] = key
+                return key
+
+    # Fallback for bootstrap paths before an agent key is available.
+    return str(os.environ.get("COGNEE_API_KEY", "") or "").strip()
+
+
+def resolved_http_endpoint_auth() -> tuple[str, str]:
+    """Return (service_url, api_key) for runtime HTTP calls.
+
+    Service URL always falls back to localhost. API key is resolved from env
+    first, then from agent_keys cache by (service_url, agent_name).
+    """
+    service_url = _normalize_service_url(_local_api_url())
+    api_key = _api_key().strip()
+    if service_url:
+        os.environ["COGNEE_SERVICE_URL"] = service_url
+    if api_key:
+        os.environ["COGNEE_API_KEY"] = api_key
+    return service_url, api_key
+
+
+def http_api_ready() -> bool:
+    service_url, api_key = resolved_http_endpoint_auth()
+    return bool(service_url and api_key)
+
+
+def resolve_runtime_mode() -> dict:
+    """Resolve hook runtime mode from effective endpoint auth."""
+    service_url, api_key = resolved_http_endpoint_auth()
+    mode = "http" if (service_url and api_key) else "local_sdk"
+    return {
+        "mode": mode,
+        "service_url": service_url,
+        "api_key_present": bool(api_key),
+    }
+
+
+def set_agent_registration(registered: bool, session_key: str = "") -> None:
+    # No local resolved cache to patch.
+    _ = (registered, session_key)
 
 
 def _json_http_request(
@@ -458,6 +641,55 @@ def remember_entry_via_http(
         },
         timeout=timeout,
     )
+
+
+def register_agent_via_http(
+    *,
+    agent_session_name: str,
+    session_id: str = "",
+    dataset_names: list[str] | None = None,
+    timeout: float = 15.0,
+) -> tuple[bool, dict]:
+    payload = {
+        "agent_session_name": agent_session_name,
+        "type": "api",
+        "memory_mode": "hybrid",
+        "source": "api",
+    }
+    if session_id:
+        payload["session_id"] = session_id
+    if dataset_names:
+        payload["dataset_names"] = [str(name) for name in dataset_names if str(name).strip()]
+
+    try:
+        result = _json_http_request(
+            "/api/v1/agents/register", payload, method="POST", timeout=timeout
+        )
+        if isinstance(result, dict):
+            return True, result
+        return True, {}
+    except Exception as exc:
+        hook_log("agent_register_failed", {"error": str(exc)[:200]})
+        return False, {}
+
+
+def unregister_agent_via_http(
+    *, agent_session_name: str, timeout: float = 15.0
+) -> tuple[bool, int]:
+    try:
+        result = _json_http_request(
+            "/api/v1/agents/unregister",
+            {"agent_session_name": agent_session_name},
+            method="POST",
+            timeout=timeout,
+        )
+        if isinstance(result, dict):
+            count = int(result.get("activeAgents", 0) or result.get("active_agents", 0) or 0)
+            return True, count
+        return True, 0
+    except Exception as exc:
+        hook_log("agent_unregister_failed", {"error": str(exc)[:200]})
+        return False, 0
 
 
 def recall_via_http(

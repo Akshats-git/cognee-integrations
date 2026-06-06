@@ -1,0 +1,63 @@
+{
+  "name": "n8n-nodes-cognee",
+  "version": "0.4.1",
+  "description": "n8n node to call Cognee Cloud API and its memory services",
+  "keywords": [
+    "n8n-community-node-package"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/topoteretes/cognee-integrations/tree/main/integrations/n8n",
+  "author": {
+    "name": "Laszlo Hajdu PhD",
+    "email": "laszlo@topoteretes.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/topoteretes/cognee-integrations.git",
+    "directory": "integrations/n8n"
+  },
+  "engines": {
+    "node": ">=20.15"
+  },
+  "main": "dist/nodes/Cognee/Cognee.node.js",
+  "scripts": {
+    "build": "n8n-node build",
+    "dev": "n8n-node dev",
+    "lint": "n8n-node lint",
+    "lintfix": "n8n-node lint --fix",
+    "format": "prettier nodes credentials --write",
+    "release": "n8n-node release",
+    "prepublishOnly": "npm run build && npm run lint"
+  },
+  "files": [
+    "dist"
+  ],
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "credentials": [
+      "dist/credentials/CogneeApi.credentials.js"
+    ],
+    "nodes": [
+      "dist/nodes/Cognee/Cognee.node.js"
+    ]
+  },
+  "devDependencies": {
+    "@n8n/node-cli": "^0.23.1",
+    "@typescript-eslint/typescript-estree": "^8.57.2",
+    "eslint": "^9.39.4",
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.2"
+  },
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  },
+  "release-it": {
+    "git": {
+      "tagName": "n8n-v${version}",
+      "commitMessage": "chore(n8n): release v${version}"
+    },
+    "github": {
+      "releaseName": "n8n-v${version}"
+    }
+  }
+}

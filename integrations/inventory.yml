@@ -49,6 +49,18 @@ integrations:
     migration_status: done
     notes: "Codex local plugin marketplace with Cognee CLI skills for setup, memory, codebase ingestion, and UI launch"
 
+  - slug: hermes-agent
+    name: "Cognee Memory Plugin for Hermes Agent"
+    owner: cognee
+    language: python
+    registry: pypi
+    package_name: "cognee-integration-hermes-agent"
+    cognee_dependency: sdk
+    current_version: "0.1.0"
+    migration_status: done
+    source_repo: https://github.com/NousResearch/hermes-agent/pull/7418
+    notes: "Standalone Hermes memory provider plugin; replaces closed in-tree PR path"
+
   - slug: dify
     name: "Cognee Tool Plugin for Dify"
     owner: cognee

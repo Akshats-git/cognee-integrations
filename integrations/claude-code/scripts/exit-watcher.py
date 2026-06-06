@@ -14,7 +14,7 @@ import sys
 import time
 from pathlib import Path
 
-_PLUGIN_DIR = Path.home() / ".cognee-plugin" / "codex"
+_PLUGIN_DIR = Path.home() / ".cognee-plugin"
 _EXIT_WATCHERS_DIR = _PLUGIN_DIR / "exit-watchers"
 _PIDFILE = _PLUGIN_DIR / "exit-watcher.pid"
 _LOGFILE = _PLUGIN_DIR / "exit-watcher.log"
@@ -110,7 +110,7 @@ def main() -> None:
 
     parent_pid = int(bootstrap.get("parent_pid") or 0)
     session_id = str(bootstrap.get("session_id") or "")
-    dataset = str(bootstrap.get("dataset") or "codex_sessions")
+    dataset = str(bootstrap.get("dataset") or "claude_sessions")
     session_key = str(bootstrap.get("session_key") or "")
     agent_session_name = str(bootstrap.get("agent_session_name") or "")
     api_key = str(bootstrap.get("api_key") or "")

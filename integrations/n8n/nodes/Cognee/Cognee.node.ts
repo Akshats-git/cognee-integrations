@@ -13,7 +13,7 @@ export class Cognee implements INodeType {
     usableAsTool: true,
     version: 1,
     subtitle: '={{$parameter["resource"] + ": " + $parameter["operation"]}}',
-    description: 'Add text data to a Cognee dataset, trigger cognify to build a knowledge graph, search Cognee memory, or delete datasets and data',
+    description: 'Add text data to a Cognee dataset, build a knowledge graph, search Cognee memory, manage datasets, and run the self-improving skill loop (ingest, review, propose, apply)',
     defaults: {
       name: 'Cognee',
     },
@@ -43,6 +43,7 @@ export class Cognee implements INodeType {
           { name: 'Cognify', value: 'cognify' },
           { name: 'Delete', value: 'delete' },
           { name: 'Search', value: 'search' },
+          { name: 'Skill', value: 'skill' },
         ],
         default: 'addData',
       },
@@ -195,6 +196,144 @@ export class Cognee implements INodeType {
           },
         ],
         default: 'deleteDataset',
+      },
+      {
+        displayName: 'Operation',
+        name: 'operation',
+        type: 'options',
+        noDataExpression: true,
+        displayOptions: {
+          show: {
+            resource: ['skill'],
+          },
+        },
+        options: [
+          {
+            name: 'Apply Improvement',
+            value: 'applyImprovement',
+            action: 'Apply an approved skill improvement proposal',
+            description: 'Apply a previously created proposal to the skill (writes the new procedure)',
+            routing: {
+              request: {
+                method: 'POST',
+                url: '/v1/remember/entry',
+                headers: { 'Content-Type': 'application/json' },
+                body: {
+                  entry: {
+                    type: 'skill_run',
+                    selected_skill_id: '={{$parameter["skillName"]}}',
+                    success_score: '={{$parameter["successScore"]}}',
+                    feedback: -1,
+                  },
+                  dataset_name: '={{$parameter["skillDatasetName"]}}',
+                  skill_improvement: {
+                    skill_name: '={{$parameter["skillName"]}}',
+                    apply: true,
+                    proposal_id: '={{$parameter["proposalId"]}}',
+                  },
+                },
+                timeout: 300000, // 5 minutes
+              },
+            },
+          },
+          {
+            name: 'Get Proposal',
+            value: 'getProposal',
+            action: 'Get a skill improvement proposal',
+            description: 'Fetch a proposal with its before/after procedures, rationale and confidence',
+            routing: {
+              request: {
+                method: 'GET',
+                url: '=/v1/proposals/{{$parameter["proposalId"]}}',
+              },
+            },
+          },
+          {
+            name: 'Get Skill',
+            value: 'getSkill',
+            action: 'Get a skill including its procedure body',
+            description: 'Fetch one skill (including its full procedure) by ID',
+            routing: {
+              request: {
+                method: 'GET',
+                url: '=/v1/skills/{{$parameter["skillId"]}}',
+              },
+            },
+          },
+          {
+            name: 'Ingest Skill',
+            value: 'ingestSkill',
+            action: 'Ingest a skill md into a dataset',
+            description: 'Ingest inline SKILL.md markdown as a dataset-scoped skill (no file upload)',
+            routing: {
+              request: {
+                method: 'POST',
+                url: '/v1/skills',
+                headers: { 'Content-Type': 'application/json' },
+                body: {
+                  skills_text: '={{$parameter["skillsText"]}}',
+                  skill_name: '={{$parameter["skillName"]}}',
+                  dataset_name: '={{$parameter["skillDatasetName"]}}',
+                },
+                timeout: 600000, // 10 minutes
+              },
+            },
+          },
+          {
+            name: 'Propose Improvement',
+            value: 'proposeImprovement',
+            action: 'Propose a skill improvement from a weak run',
+            description: 'Record a low-scoring skill run and create a skill-improvement proposal (not applied)',
+            routing: {
+              request: {
+                method: 'POST',
+                url: '/v1/remember/entry',
+                headers: { 'Content-Type': 'application/json' },
+                body: {
+                  entry: {
+                    type: 'skill_run',
+                    selected_skill_id: '={{$parameter["skillName"]}}',
+                    task_text: '={{$parameter["taskText"]}}',
+                    result_summary: '={{$parameter["resultSummary"]}}',
+                    success_score: '={{$parameter["successScore"]}}',
+                    feedback: -1,
+                    candidate_skill_ids: '={{[$parameter["skillName"]]}}',
+                  },
+                  dataset_name: '={{$parameter["skillDatasetName"]}}',
+                  skill_improvement: {
+                    skill_name: '={{$parameter["skillName"]}}',
+                    apply: false,
+                    score_threshold: '={{$parameter["scoreThreshold"]}}',
+                  },
+                },
+                timeout: 300000, // 5 minutes
+              },
+            },
+          },
+          {
+            name: 'Review Skill',
+            value: 'reviewSkill',
+            action: 'Run a skill aware agentic review',
+            description: 'Run an AGENTIC_COMPLETION search that loads the given skill to review a task',
+            routing: {
+              request: {
+                method: 'POST',
+                url: '/v1/search',
+                headers: { 'Content-Type': 'application/json' },
+                body: {
+                  search_type: 'AGENTIC_COMPLETION',
+                  query: '={{$parameter["reviewQuery"]}}',
+                  datasets: '={{[$parameter["skillDatasetName"]]}}',
+                  skills: '={{[$parameter["skillName"]]}}',
+                  max_iter: '={{$parameter["reviewMaxIter"]}}',
+                  top_k: '={{$parameter["reviewTopK"]}}',
+                },
+                timeout: 300000, // 5 minutes
+              },
+            },
+          },
+        ],
+        default: 'ingestSkill',
       },
       // Add action fields
       {
@@ -404,6 +543,212 @@ export class Cognee implements INodeType {
           show: {
             resource: ['delete'],
             operation: ['deleteData'],
+          },
+        },
+      },
+      // Skill action fields
+      {
+        displayName: 'Skill Name',
+        name: 'skillName',
+        type: 'string',
+        default: '',
+        required: true,
+        description: 'Name/slug of the skill (e.g. "code-review")',
+        displayOptions: {
+          show: {
+            resource: ['skill'],
+            operation: ['ingestSkill', 'reviewSkill', 'proposeImprovement', 'applyImprovement'],
+          },
+        },
+      },
+      {
+        displayName: 'Dataset Name',
+        name: 'skillDatasetName',
+        type: 'string',
+        default: '',
+        required: true,
+        description: 'Name of the dataset the skill lives in (created if needed on ingest)',
+        displayOptions: {
+          show: {
+            resource: ['skill'],
+            operation: ['ingestSkill', 'reviewSkill', 'proposeImprovement', 'applyImprovement'],
+          },
+        },
+      },
+      {
+        displayName: 'Skill Markdown',
+        name: 'skillsText',
+        type: 'string',
+        typeOptions: {
+          rows: 8,
+        },
+        default: '',
+        required: true,
+        description: 'The full SKILL.md markdown body to ingest (frontmatter optional)',
+        displayOptions: {
+          show: {
+            resource: ['skill'],
+            operation: ['ingestSkill'],
+          },
+        },
+      },
+      {
+        displayName: 'Query',
+        name: 'reviewQuery',
+        type: 'string',
+        typeOptions: {
+          rows: 4,
+        },
+        default: '',
+        required: true,
+        description: 'The review task to run with the skill loaded (agentic completion)',
+        displayOptions: {
+          show: {
+            resource: ['skill'],
+            operation: ['reviewSkill'],
+          },
+        },
+      },
+      {
+        displayName: 'Max Iterations',
+        name: 'reviewMaxIter',
+        type: 'number',
+        default: 6,
+        description: 'Maximum agentic tool-call iterations before forcing a final answer',
+        displayOptions: {
+          show: {
+            resource: ['skill'],
+            operation: ['reviewSkill'],
+          },
+        },
+      },
+      {
+        displayName: 'Top K',
+        name: 'reviewTopK',
+        type: 'number',
+        default: 15,
+        description: 'Number of elements to retrieve during context creation',
+        displayOptions: {
+          show: {
+            resource: ['skill'],
+            operation: ['reviewSkill'],
+          },
+        },
+      },
+      {
+        displayName: 'Task Text',
+        name: 'taskText',
+        type: 'string',
+        typeOptions: {
+          rows: 3,
+        },
+        default: '',
+        description: 'The task that was attempted (recorded on the skill run)',
+        displayOptions: {
+          show: {
+            resource: ['skill'],
+            operation: ['proposeImprovement'],
+          },
+        },
+      },
+      {
+        displayName: 'Result Summary',
+        name: 'resultSummary',
+        type: 'string',
+        typeOptions: {
+          rows: 3,
+        },
+        default: '',
+        description: 'Summary of what the weak run produced / what instruction was missing',
+        displayOptions: {
+          show: {
+            resource: ['skill'],
+            operation: ['proposeImprovement'],
+          },
+        },
+      },
+      {
+        displayName: 'Success Score',
+        name: 'successScore',
+        type: 'number',
+        typeOptions: {
+          minValue: 0,
+          maxValue: 1,
+          numberPrecision: 2,
+        },
+        default: 0,
+        description: 'Evaluator score for the run in range [0, 1]',
+        displayOptions: {
+          show: {
+            resource: ['skill'],
+            operation: ['proposeImprovement', 'applyImprovement'],
+          },
+        },
+      },
+      {
+        displayName: 'Score Threshold',
+        name: 'scoreThreshold',
+        type: 'number',
+        typeOptions: {
+          minValue: 0,
+          maxValue: 1,
+          numberPrecision: 2,
+        },
+        default: 0.9,
+        description: 'Minimum score required to skip improvement (runs at or below trigger a proposal)',
+        displayOptions: {
+          show: {
+            resource: ['skill'],
+            operation: ['proposeImprovement'],
+          },
+        },
+      },
+      {
+        displayName: 'Proposal ID',
+        name: 'proposalId',
+        type: 'string',
+        default: '',
+        required: true,
+        description: 'The proposal_id returned by Propose Improvement',
+        displayOptions: {
+          show: {
+            resource: ['skill'],
+            operation: ['applyImprovement', 'getProposal'],
+          },
+        },
+      },
+      {
+        displayName: 'Skill ID',
+        name: 'skillId',
+        type: 'string',
+        default: '',
+        required: true,
+        description: 'The skill identifier returned by Get Skill / list',
+        displayOptions: {
+          show: {
+            resource: ['skill'],
+            operation: ['getSkill'],
+          },
+        },
+      },
+      {
+        displayName: 'Dataset ID',
+        name: 'getDatasetId',
+        type: 'string',
+        default: '',
+        required: true,
+        description: 'UUID of the dataset the skill/proposal is scoped to (returned by Ingest Skill)',
+        displayOptions: {
+          show: {
+            resource: ['skill'],
+            operation: ['getSkill', 'getProposal'],
+          },
+        },
+        routing: {
+          request: {
+            qs: {
+              dataset_id: '={{$value}}',
+            },
           },
         },
       },

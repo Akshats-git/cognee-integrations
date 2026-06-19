@@ -1,8 +1,88 @@
 import type {
+  IExecuteSingleFunctions,
+  IN8nHttpFullResponse,
+  INodeExecutionData,
   INodeType,
   INodeTypeDescription,
 } from 'n8n-workflow';
 import { NodeConnectionTypes } from 'n8n-workflow';
+
+/**
+ * Pull the agent's answer text out of the /v1/search response envelope.
+ * AGENTIC_COMPLETION returns the answer wrapped in a list and/or a
+ * { search_result: ... } object, so unwrap recursively (mirrors the SDK's
+ * unwrap_answer in run_self_improve_skill.py).
+ */
+function unwrapSearchAnswer(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.length ? unwrapSearchAnswer(value[0]) : '';
+  }
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    for (const key of ['search_result', 'result', 'answer', 'text']) {
+      if (key in obj) {
+        return unwrapSearchAnswer(obj[key]);
+      }
+    }
+    return JSON.stringify(obj);
+  }
+  return value == null ? '' : String(value);
+}
+
+/**
+ * Tolerantly parse the strict-JSON review the prompt asks for. Falls back to
+ * extracting the first {...} block if the model wrapped it in prose/fences.
+ */
+function parseReviewJson(text: string): Record<string, unknown> {
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    const match = text.match(/\{[\s\S]*\}/);
+    if (match) {
+      try {
+        return JSON.parse(match[0]) as Record<string, unknown>;
+      } catch {
+        return {};
+      }
+    }
+    return {};
+  }
+}
+
+/**
+ * postReceive transform for the Review Skill operation: turns the raw search
+ * response into a flat item exposing { score, missing_instruction,
+ * result_summary, dimensions, review } so the workflow's IF gate can branch on
+ * `score` with no extra node. The score is the LLM-emitted mean of the
+ * per-dimension scores. On unparseable output, score defaults to 0 (treated as
+ * a failing review) and the raw answer is preserved for debugging.
+ */
+async function parseReviewScore(
+  this: IExecuteSingleFunctions,
+  _items: INodeExecutionData[],
+  response: IN8nHttpFullResponse,
+): Promise<INodeExecutionData[]> {
+  const answer = unwrapSearchAnswer(response.body);
+  const parsed = parseReviewJson(answer);
+  const rawScore = Number(parsed.score);
+  const parseOk = Number.isFinite(rawScore);
+  const score = parseOk ? Math.max(0, Math.min(1, rawScore)) : 0;
+  return [
+    {
+      json: {
+        score,
+        score_parse_ok: parseOk,
+        missing_instruction: (parsed.missing_instruction as string) ?? '',
+        result_summary:
+          (parsed.result_summary as string) ??
+          (parseOk ? '' : 'Could not parse a score from the review; raw answer preserved.'),
+        dimensions: parsed.dimensions ?? [],
+        review: (parsed.review as string) ?? answer,
+        raw_answer: answer,
+      },
+    },
+  ];
+}
 
 export class Cognee implements INodeType {
   description: INodeTypeDescription = {
@@ -329,6 +409,9 @@ export class Cognee implements INodeType {
                   top_k: '={{$parameter["reviewTopK"]}}',
                 },
                 timeout: 300000, // 5 minutes
+              },
+              output: {
+                postReceive: [parseReviewScore],
               },
             },
           },

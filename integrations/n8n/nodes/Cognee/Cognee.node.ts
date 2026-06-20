@@ -31,22 +31,46 @@ function unwrapSearchAnswer(value: unknown): string {
 
 /**
  * Tolerantly parse the strict-JSON review the prompt asks for. Falls back to
- * extracting the first {...} block if the model wrapped it in prose/fences.
+ * extracting the first {...} block if the model wrapped it in prose/fences,
+ * and finally falls back to regex extraction of the self-review prose block
+ * the model sometimes produces instead of JSON.
  */
 function parseReviewJson(text: string): Record<string, unknown> {
+  // 1. Pure JSON response
   try {
     return JSON.parse(text) as Record<string, unknown>;
-  } catch {
-    const match = text.match(/\{[\s\S]*\}/);
-    if (match) {
-      try {
-        return JSON.parse(match[0]) as Record<string, unknown>;
-      } catch {
-        return {};
-      }
-    }
-    return {};
+  } catch { /* fall through */ }
+
+  // 2. JSON block embedded in prose or fenced code block
+  const match = text.match(/\{[\s\S]*\}/);
+  if (match) {
+    try {
+      return JSON.parse(match[0]) as Record<string, unknown>;
+    } catch { /* fall through */ }
   }
+
+  // 3. Prose self-review block: "Overall score: 0.94" + per-dimension bullet list
+  const scoreMatch = text.match(/[Oo]verall\s+score[:\s]+([0-9]*\.?[0-9]+)/);
+  if (scoreMatch) {
+    const score = parseFloat(scoreMatch[1]);
+    const dimensions: Array<{ name: string; score: number }> = [];
+    const dimPattern = /-\s*([\w_]+):\s*([0-9]*\.?[0-9]+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = dimPattern.exec(text)) !== null) {
+      dimensions.push({ name: m[1], score: parseFloat(m[2]) });
+    }
+    const missingMatch = text.match(/[Mm]issing\s+instruction[:\s]+([^\n]+)/);
+    const summaryMatch = text.match(/[Rr]esult\s+summary[:\s]+([^\n]+(?:\n[^\n]+)*?)(?=\n\n|\n[A-Z]|$)/);
+    return {
+      score,
+      dimensions,
+      missing_instruction: missingMatch ? missingMatch[1].trim() : '',
+      result_summary: summaryMatch ? summaryMatch[1].trim() : '',
+      review: text,
+    };
+  }
+
+  return {};
 }
 
 /**

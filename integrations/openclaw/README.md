@@ -14,7 +14,7 @@ OpenClaw plugin that adds Cognee-backed memory with **multi-scope support** (com
 - **In-session memory**: each recall call auto-captures the turn as a `QAEntry` in Cognee's session cache; with `AUTO_FEEDBACK=true` set on the Cognee container, follow-up messages are auto-classified as feedback and attached to the previous QA; `session_end` triggers `/improve` to bridge the session cache into the graph
 - **One-command setup**: `openclaw cognee setup` configures Cognee as the sole memory provider
 - **CLI commands**: `openclaw cognee setup`, `openclaw cognee index`, `openclaw cognee status`, `openclaw cognee version`, `openclaw cognee health`, `openclaw cognee scopes`, `openclaw cognee forget`, `openclaw cognee improve`
-- **Version display**: `openclaw cognee status` (and `openclaw cognee version`) shows the installed plugin version and, when a newer version is published on npm, an "update available" badge
+- **Version display**: `openclaw cognee status` (and `openclaw cognee version`) shows the installed plugin version, plus an update hint when a newer version is published on npm
 
 ## Security: Recommended Plugin Allowlist
 
@@ -273,8 +273,8 @@ openclaw cognee setup --hybrid     # Keep built-ins enabled in config (runtime c
 openclaw cognee index
 
 # Check sync status (files indexed, dataset info, per-scope breakdown)
-# The first line shows the installed plugin version, plus an "update available"
-# badge when a newer version is published on npm.
+# The first line shows the installed plugin version, plus an update hint
+# when a newer version is published on npm.
 openclaw cognee status
 
 # Show the installed plugin version on its own
@@ -313,9 +313,9 @@ openclaw cognee improve --session-id <id>     # scope to one session
 
 ## Version & Update Check
 
-`openclaw cognee status` prints the installed plugin version on its first line. On startup the plugin also runs a background, best-effort check against the npm registry for a newer published version and caches the result. When a newer version exists, `status` (and `openclaw cognee version`) shows an "update available" badge pointing at `openclaw plugins install @cognee/cognee-openclaw@latest`.
+`openclaw cognee status` prints the installed plugin version on its first line. On startup the plugin runs a background check against the npm registry for a newer published version and caches the result. When a newer version is available, `status` and `openclaw cognee version` print an update hint that points to `openclaw plugins install @cognee/cognee-openclaw@latest`.
 
-The check is cached and rate-limited so it never blocks a command or the gateway, and a network failure is silently ignored (it never reports a false update). Use `--check-updates` to force a live check now.
+The check is cached and rate-limited so it never blocks a command or the gateway. A network failure is ignored, so the check never reports a false update. Use `--check-updates` to force a live check now.
 
 | Env var | Default | Description |
 |---------|---------|-------------|
